@@ -1,0 +1,6 @@
+flask
+gunicorn
+requests
+python-dotenv
+faster-whisper
+msal==1.31.0
