@@ -1,60 +1,44 @@
 import os
-import time
-import uuid
-import json
+import re
 import tempfile
 import threading
-import requests
+import subprocess
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from flask import Flask, request, jsonify, render_template, redirect, session as flask_session
-from dotenv import load_dotenv
+import requests
+from flask import Flask, request, jsonify, render_template
 from faster_whisper import WhisperModel
 
-# NEW: Microsoft auth
-import msal
+# -----------------------------------
+# Load .env locally only (not Render)
+# -----------------------------------
+if os.getenv("RENDER") is None:
+    from dotenv import load_dotenv
+    load_dotenv()
 
-load_dotenv()
-
-# -------------------------
-# DeepSeek config (unchanged)
-# -------------------------
+# -----------------------------------
+# DeepSeek config
+# -----------------------------------
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# -------------------------
-# Whisper config (unchanged)
-# -------------------------
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
+# -----------------------------------
+# Whisper config
+# -----------------------------------
+# tiny is most reliable on low-CPU instances
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
 
-# -------------------------
-# NEW: OneNote / Microsoft Graph config
-# -------------------------
-MS_CLIENT_ID = os.getenv("MS_CLIENT_ID")
-MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET")
-MS_TENANT_ID = os.getenv("MS_TENANT_ID")
-MS_REDIRECT_URI = os.getenv("MS_REDIRECT_URI")  # e.g. https://www.clineraclinic.com/
-
-# Optional: force a section (recommended once you know it)
-ONENOTE_SECTION_ID = (os.getenv("ONENOTE_SECTION_ID") or "").strip()
-
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
-AUTHORITY = f"https://login.microsoftonline.com/{MS_TENANT_ID}" if MS_TENANT_ID else None
-
-# Keep least privilege to create pages
-SCOPES = ["User.Read", "Notes.Create"]
-
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("Missing DEEPSEEK_API_KEY environment variable.")
-
+# -----------------------------------
+# Flask app
+# -----------------------------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
-app.secret_key = os.getenv("SESSION_SECRET", "dev_only_change_me")  # REQUIRED for login session
+http = requests.Session()
 
-session = requests.Session()
-
-# -------------------------
-# Whisper model load-once + locks (prevents memory spikes)
-# -------------------------
+# -----------------------------------
+# Whisper model (load once)
+# -----------------------------------
 _whisper_model = None
 _whisper_init_lock = threading.Lock()
 _transcribe_lock = threading.Lock()
@@ -71,44 +55,115 @@ def get_whisper_model():
                 )
     return _whisper_model
 
-# -------------------------
-# NEW: MSAL helpers
-# -------------------------
-def _msal_app():
-    if not (MS_CLIENT_ID and MS_CLIENT_SECRET and MS_TENANT_ID and MS_REDIRECT_URI and AUTHORITY):
-        return None
-    return msal.ConfidentialClientApplication(
-        MS_CLIENT_ID,
-        authority=AUTHORITY,
-        client_credential=MS_CLIENT_SECRET
-    )
+def awst_timestamp() -> str:
+    # Western Australia time
+    dt = datetime.now(ZoneInfo("Australia/Perth"))
+    return dt.strftime("%d %b %Y, %H:%M (AWST)")
 
-def _get_access_token():
-    tok = flask_session.get("ms_token")
-    if isinstance(tok, dict) and tok.get("access_token"):
-        return tok["access_token"]
-    return None
+def extract_field(text: str, labels: list[str]) -> str:
+    """
+    Extracts value after labels like:
+    'DVA Patient Name: John Smith'
+    'Name - John Smith'
+    'Name=John Smith'
+    """
+    if not text:
+        return ""
+    for lab in labels:
+        # label followed by : or - or =
+        pattern = rf"(?im)^\s*{re.escape(lab)}\s*[:=\-]\s*(.+?)\s*$"
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1).strip()
+    return ""
 
-def _onenote_html_page(title: str, body_text: str) -> str:
-    # OneNote create-page expects HTML request body.
-    safe_title = (title or "WR Note").replace("&", "and").strip()
-    safe_body = (body_text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-  <title>{safe_title}</title>
-  <meta name="created" content="{created}" />
-</head>
-<body>
-  <h1>{safe_title}</h1>
-  <pre>{safe_body}</pre>
-</body>
-</html>"""
+def normalise_card_type(s: str) -> str:
+    s = (s or "").strip().lower()
+    if not s:
+        return ""
+    if "gold" in s:
+        return "Gold"
+    if "white" in s:
+        return "White"
+    return s[:1].upper() + s[1:]
 
-# -------------------------
-# Routes (existing)
-# -------------------------
+def build_dva_header(user_text: str) -> str:
+    name = extract_field(user_text, ["DVA patient name", "Patient name", "Name", "Patient"])
+    card = extract_field(user_text, ["DVA card", "Card type", "Card", "DVA card type"])
+    dva_no = extract_field(user_text, ["DVA number", "DVA no", "File number", "File no"])
+    accepted = extract_field(user_text, ["Accepted conditions", "Accepted condition", "Accepted", "White card accepted conditions"])
+    referral = extract_field(user_text, ["Referral type", "Referral", "Requested referral", "Discipline"])
+    contact = extract_field(user_text, ["Contact number", "Phone", "Mobile", "Contact"])
+
+    card = normalise_card_type(card)
+
+    header = []
+    header.append(f"DVA Patient Name: {name or ''}")
+    header.append(f"DVA Card Type: {card or 'Not specified'}")
+    header.append(f"DVA Number: {dva_no or ''}")
+    header.append(f"Accepted Conditions: {accepted or 'Not specified'}")
+    header.append(f"Referral Type: {referral or ''}")
+    header.append(f"Contact Number: {contact or ''}")
+    header.append("")
+    header.append("Telehealth Consult:")
+    header.append("Dr Michael Addis")
+    header.append(f"Date & Time (AWST): {awst_timestamp()}")
+    return "\n".join(header).strip()
+
+# -----------------------------------
+# Prompts
+# -----------------------------------
+CLINICAL_SYSTEM_PROMPT = (
+    "You are an Australian clinical education assistant for qualified medical doctors.\n\n"
+    "Audience:\n"
+    "Australian hospital/GP doctors (PGY2+, registrars, consultants). Not patient-facing.\n\n"
+    "OUTPUT FORMAT (MANDATORY):\n"
+    "Use these headings EXACTLY, each on its own line:\n"
+    "Summary\n"
+    "Assessment\n"
+    "Diagnosis\n"
+    "Investigations\n"
+    "Treatment\n"
+    "Monitoring\n"
+    "Follow-up & Safety Netting\n"
+    "Red Flags\n"
+    "References\n\n"
+    "STYLE:\n"
+    "Plain text only. No markdown symbols (###, **, *, •).\n"
+    "Registrar-level depth. Australian practice framing.\n"
+    "Do not quote proprietary sources verbatim.\n"
+    "References should name source families only (e.g. Therapeutic Guidelines/eTG, AMH, Australian Immunisation Handbook, local protocols).\n"
+)
+
+DVA_SYSTEM_PROMPT = (
+    "You are an Australian medical practitioner assisting other qualified clinicians with DVA documentation.\n\n"
+    "Goal:\n"
+    "Assess whether the referral justification is defensible and identify missing elements that increase audit risk.\n"
+    "Produce an individualised clinical note. Do not claim DVA approval.\n\n"
+    "IMPORTANT:\n"
+    "Do not invent accepted conditions or entitlements.\n"
+    "If details are missing, explicitly say what is missing and why it matters.\n"
+    "Avoid boilerplate. Use the patient-specific details provided.\n\n"
+    "OUTPUT FORMAT (MANDATORY):\n"
+    "Use these headings EXACTLY, each on its own line:\n"
+    "Summary\n"
+    "Assessment\n"
+    "Diagnosis\n"
+    "Investigations\n"
+    "Treatment\n"
+    "Monitoring\n"
+    "Follow-up & Safety Netting\n"
+    "Red Flags\n"
+    "References\n\n"
+    "Within the sections:\n"
+    "Assessment must include: justification strength + gaps + audit-risk flags.\n"
+    "Treatment must include: a rewritten, individualised clinical note paragraph suitable for records.\n"
+    "Use plain text only. No markdown.\n"
+)
+
+# -----------------------------------
+# Routes
+# -----------------------------------
 @app.route("/healthz")
 def healthz():
     return "ok", 200
@@ -120,120 +175,119 @@ def index():
     except Exception:
         return "vividmedi backend running", 200
 
+# ---------- TRANSCRIBE ----------
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe():
     """
-    Receives audio as multipart/form-data with field name 'audio'
-    Returns JSON: { "text": "..." }
+    Browser uploads audio/webm (opus).
+    Convert to 16kHz mono WAV with ffmpeg, then transcribe with faster_whisper.
     """
     if "audio" not in request.files:
-        return jsonify({"error": "Missing audio field 'audio'."}), 400
+        return jsonify({"error": "Missing audio"}), 400
 
-    # Prevent overlapping transcribes (CPU/memory protection)
     if not _transcribe_lock.acquire(blocking=False):
-        return jsonify({"error": "Server busy. Try again."}), 429
+        return jsonify({"error": "Server busy"}), 429
 
-    f = request.files["audio"]
-    if not f:
-        _transcribe_lock.release()
-        return jsonify({"error": "Empty audio upload."}), 400
+    tmp_webm = None
+    tmp_wav = None
 
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-            tmp_path = tmp.name
-            f.save(tmp_path)
+        f = request.files["audio"]
 
-        whisper_model = get_whisper_model()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as t1:
+            tmp_webm = t1.name
+            f.save(tmp_webm)
 
-        # Optional prompt helps medical vocab a bit
-        medical_prompt = (
-            "Australian clinician dictation. Common terms: morphine, fentanyl, ketamine, ondansetron, "
-            "metoclopramide, lamotrigine, levetiracetam, valproate, phenytoin, thiamine, Wernicke, "
-            "re-feeding syndrome, phosphate, magnesium, NG tube, dosage, milligrams, micrograms, per kilogram."
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as t2:
+            tmp_wav = t2.name
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_webm, "-ac", "1", "-ar", "16000", tmp_wav],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
         )
 
-        segments, info = whisper_model.transcribe(
-            tmp_path,
+        model = get_whisper_model()
+        segments, _ = model.transcribe(
+            tmp_wav,
             language="en",
-            initial_prompt=medical_prompt,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 400},
-            beam_size=5,
-            best_of=5,
+            vad_filter=False,
             temperature=0.0,
-            condition_on_previous_text=False
+            beam_size=5,
+            condition_on_previous_text=False,
         )
 
-        text = " ".join(seg.text.strip() for seg in segments).strip()
+        text = " ".join(s.text.strip() for s in segments).strip()
         return jsonify({"text": text})
 
     except Exception as e:
         print("TRANSCRIBE ERROR:", repr(e))
-        return jsonify({"error": "Transcription failed on server."}), 502
+        return jsonify({"error": "Transcription failed"}), 502
 
     finally:
         _transcribe_lock.release()
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        for p in (tmp_webm, tmp_wav):
+            if p:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
-
+# ---------- GENERATE ----------
 @app.route("/api/generate", methods=["POST"])
 def generate():
+    """
+    Request JSON:
+      { "query": "...", "mode": "clinical" | "dva" }
+
+    - mode defaults to "clinical"
+    """
+    if not DEEPSEEK_API_KEY:
+        return jsonify({"error": "Server misconfigured: missing DEEPSEEK_API_KEY"}), 500
+
     data = request.get_json(silent=True) or {}
     query = (data.get("query") or "").strip()
+    mode = (data.get("mode") or "clinical").strip().lower()
+
     if not query:
-        return jsonify({"error": "No query provided."}), 400
+        return jsonify({"error": "Empty query"}), 400
 
-    system_prompt = (
-        "You are an AI clinical education assistant for qualified clinicians and doctors "
-        "in training working in Australian hospitals.\n\n"
-        "Purpose and limits:\n"
-        "- Your role is to support STUDY, REVISION and exam-style reasoning.\n"
-        "- You are NOT providing live clinical decision support for real patients.\n"
-        "- Do not present recommendations as orders or directives; instead frame them as "
-        "educational guidance that must be checked against local protocols and senior advice.\n\n"
-        "Jurisdiction and practice context:\n"
-        "- Assume an Australian hospital setting unless clearly stated otherwise.\n"
-        "- Bias your explanations toward what is broadly consistent with contemporary Australian "
-        "practice and guidelines.\n"
-        "- Do NOT name or quote proprietary resources.\n"
-        "- Use Australian spelling.\n\n"
-        "Safety and prescribing:\n"
-        "- When you mention medicines, discuss broad dose ranges only and recommend checking local references.\n\n"
-        "Response structure:\n"
-        "Use plain-text headings (only include relevant ones):\n"
-        "Summary\n"
-        "Assessment\n"
-        "Diagnosis\n"
-        "Investigations\n"
-        "Treatment\n"
-        "Monitoring\n"
-        "Follow-up & Safety Netting\n"
-        "Red Flags\n"
-        "References\n\n"
-        "Formatting:\n"
-        "- One key point per line.\n"
-        "- No markdown symbols.\n"
-    )
+    if mode == "dva":
+        header = build_dva_header(query)
 
-    user_content = (
-        "This is a hypothetical, de-identified clinical study question for educational purposes only.\n\n"
-        f"Clinical question:\n{query}"
-    )
+        user_content = (
+            "Use the details below to assess DVA referral justification.\n"
+            "Return a structured doctor-level answer with the required headings.\n\n"
+            "PATIENT HEADER (must appear at the top of your response exactly as provided):\n"
+            f"{header}\n\n"
+            "DETAILS:\n"
+            f"{query}\n\n"
+            "Instructions:\n"
+            "In Assessment, clearly state:\n"
+            "Justification strength (strong / moderate / weak)\n"
+            "Gaps (missing items)\n"
+            "Audit-risk flags\n"
+            "In Treatment, provide an individualised clinical note paragraph that is defensible and patient-specific.\n"
+        )
+
+        system_prompt = DVA_SYSTEM_PROMPT
+    else:
+        user_content = (
+            "This is a hypothetical, de-identified clinical question for educational purposes.\n\n"
+            f"Clinical question:\n{query}"
+        )
+        system_prompt = CLINICAL_SYSTEM_PROMPT
 
     payload = {
-        "model": MODEL,
+        "model": DEEPSEEK_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
         "temperature": 0.25,
         "top_p": 0.9,
-        "max_tokens": 1100,
+        "max_tokens": 1600,
         "stream": False,
     }
 
@@ -243,112 +297,36 @@ def generate():
     }
 
     try:
-        resp = session.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=40)
-        print("DeepSeek status:", resp.status_code)
+        resp = http.post(DEEPSEEK_URL, json=payload, headers=headers, timeout=70)
         resp.raise_for_status()
-        data = resp.json()
+        out = resp.json()
+
         answer = (
-            (data.get("choices") or [{}])[0]
+            (out.get("choices") or [{}])[0]
             .get("message", {})
             .get("content", "")
             .strip()
         )
-        if not answer:
-            return jsonify({"error": "Empty response from model."}), 502
-        return jsonify({"answer": answer})
+
+        # Light cleanup if model sneaks markdown in
+        if answer:
+            answer = answer.replace("\r", "")
+            answer = answer.replace("###", "")
+            answer = answer.replace("**", "")
+            cleaned = []
+            for line in answer.splitlines():
+                cleaned.append(line.lstrip("•*- ").rstrip())
+            answer = "\n".join(cleaned).strip()
+
+        return jsonify({"answer": answer or "No response."})
+
     except Exception as e:
-        print("DeepSeek API error:", repr(e))
-        return jsonify({"error": "Error contacting DeepSeek API."}), 502
+        print("DEEPSEEK ERROR:", repr(e))
+        return jsonify({"error": "AI request failed"}), 502
 
-
-# -------------------------
-# NEW: OneNote Sign-in (adds routes; does not affect existing site)
-# -------------------------
-@app.route("/auth/login")
-def auth_login():
-    app_obj = _msal_app()
-    if not app_obj:
-        return (
-            "Microsoft auth not configured. Set MS_CLIENT_ID, MS_CLIENT_SECRET, MS_TENANT_ID, MS_REDIRECT_URI, SESSION_SECRET.",
-            500,
-        )
-
-    state = str(uuid.uuid4())
-    flask_session["ms_state"] = state
-
-    auth_url = app_obj.get_authorization_request_url(
-        scopes=SCOPES,
-        state=state,
-        redirect_uri=MS_REDIRECT_URI,
-        prompt="select_account",
-    )
-    return redirect(auth_url)
-
-@app.route("/auth/callback")
-def auth_callback():
-    app_obj = _msal_app()
-    if not app_obj:
-        return "Microsoft auth not configured.", 500
-
-    if request.args.get("state") != flask_session.get("ms_state"):
-        return "State mismatch", 400
-
-    code = request.args.get("code")
-    if not code:
-        return "Missing auth code", 400
-
-    result = app_obj.acquire_token_by_authorization_code(
-        code,
-        scopes=SCOPES,
-        redirect_uri=MS_REDIRECT_URI,
-    )
-
-    if "access_token" not in result:
-        return f"Auth failed: {result.get('error_description')}", 400
-
-    flask_session["ms_token"] = result
-    return redirect("/")
-
-
-# -------------------------
-# NEW: Send note to OneNote (backend API; UI button can call this later)
-# -------------------------
-@app.route("/api/onenote/send", methods=["POST"])
-def onenote_send():
-    token = _get_access_token()
-    if not token:
-        return jsonify({"error": "Not signed in. Visit /auth/login first."}), 401
-
-    data = request.get_json(silent=True) or {}
-    title = (data.get("title") or "WR Note").strip()
-    content = (data.get("content") or "").strip()
-
-    if not content:
-        return jsonify({"error": "Empty note content."}), 400
-
-    html = _onenote_html_page(title, content)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "text/html",
-    }
-
-    # If you set ONENOTE_SECTION_ID, it'll always write there.
-    if ONENOTE_SECTION_ID:
-        url = f"{GRAPH_BASE}/me/onenote/sections/{ONENOTE_SECTION_ID}/pages"
-    else:
-        # Writes into a section named "EBM Notes" in your default notebook.
-        url = f"{GRAPH_BASE}/me/onenote/pages?sectionName=EBM%20Notes"
-
-    try:
-        r = requests.post(url, headers=headers, data=html.encode("utf-8"), timeout=40)
-        if r.status_code not in (200, 201):
-            return jsonify({"error": "Graph error", "status": r.status_code, "detail": r.text}), 502
-        return jsonify({"ok": True})
-    except Exception as e:
-        print("ONENOTE SEND ERROR:", repr(e))
-        return jsonify({"error": "Failed to contact Microsoft Graph"}), 502
-
-
+# -----------------------------------
+# Local run
+# -----------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
