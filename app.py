@@ -109,9 +109,16 @@ def _onenote_html_page(title: str, body_text: str) -> str:
 # -------------------------
 # Routes (existing)
 # -------------------------
+@app.route("/healthz")
+def healthz():
+    return "ok", 200
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    try:
+        return render_template("index.html")
+    except Exception:
+        return "vividmedi backend running", 200
 
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe():
